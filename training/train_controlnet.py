@@ -198,7 +198,6 @@ def get_seg_flow(yolo_model, unimatch, video_frames, random_mask=True, perterb=T
     '''
     video_frames = video_frames * 255
     flow = get_optical_flow(unimatch, video_frames)  # flow, direct_flow: [b, f-1, 2, h, w]
-    # breakpoint()
     flow = torch.cat([flow, torch.zeros_like(flow[:, 0:1])], dim=1) / FLOW_SCALE
 
     mask_image_batch = []
@@ -591,36 +590,29 @@ def log_validation(
     gts=None,
     is_final_validation: bool = False,
 ):
-    scheduler_args = {}
-
-    if "variance_type" in pipe.scheduler.config:
-        variance_type = pipe.scheduler.config.variance_type
-
-        if variance_type in ["learned", "learned_range"]:
-            variance_type = "fixed_small"
-
-        scheduler_args["variance_type"] = variance_type
-
-    pipe.scheduler = CogVideoXDPMScheduler.from_config(pipe.scheduler.config, **scheduler_args)
-    pipe = pipe.to(accelerator.device)
-    # pipe.set_progress_bar_config(disable=True)
-
-    # run inference
     generator = torch.Generator(device=accelerator.device).manual_seed(args.seed) if args.seed else None
+    video = pipe(**pipeline_args, generator=generator, output_type="np").frames[0]  # [0, 1]
 
-    videos = []
-    for _ in range(args.num_validation_videos):
-        video = pipe(**pipeline_args, generator=generator, output_type="np").frames[0]
-        videos.append(video)
-    breakpoint()
+    viz_flows = []
+    for i in range(gts["flow"].shape[1]):
+        temp_flow = gts["flow"][0][i].permute(1, 2, 0)
+        viz_flows.append(flow_to_image(temp_flow))
+    viz_flows = np.stack(viz_flows) / 255.
+    
+    gt_video = (gts["video"].squeeze().permute(0, 2, 3, 1).cpu().numpy() + 1) / 2
+    gt_seg = (gts["seg_id"].squeeze().permute(0, 2, 3, 1).cpu().numpy() + 1) / 2
 
-    for i, video in enumerate(videos):
-        filename = os.path.join(args.output_dir, f"{epoch}_video_{i}.mp4")
-        export_to_video(video, filename, fps=8)
+    viz_flows = viz_flows.astype(video.dtype)
+    gt_video = gt_video.astype(video.dtype)
+    gt_seg = gt_seg.astype(video.dtype)
 
-    # clear_objs_and_retain_memory([pipe])
+    temp_nps_0 = np.concatenate([viz_flows, gt_seg], axis=2)
+    temp_nps_1 = np.concatenate([video, gt_video], axis=2)
+    total_nps = np.concatenate([temp_nps_0, temp_nps_1], axis=1)
 
-    return videos
+    idx = gts["idx"]
+    filename = os.path.join(args.output_dir, "validation", f"epoch{epoch}", f"video_{idx}.mp4")
+    export_to_video(total_nps, filename, fps=8)
 
 
 def _get_t5_prompt_embeds(
@@ -1320,16 +1312,32 @@ def main(args):
                     torch_dtype=weight_dtype,
                 )
 
+                scheduler_args = {}
+                if "variance_type" in pipe.scheduler.config:
+                    variance_type = pipe.scheduler.config.variance_type
+
+                    if variance_type in ["learned", "learned_range"]:
+                        variance_type = "fixed_small"
+
+                    scheduler_args["variance_type"] = variance_type
+
+                pipe.scheduler = CogVideoXDPMScheduler.from_config(pipe.scheduler.config, **scheduler_args)
+                pipe = pipe.to(accelerator.device)
+                # pipe.set_progress_bar_config(disable=True)
+
+                os.makedirs(os.path.join(args.output_dir, "validation", f"epoch{epoch}"), exist_ok=True)
+
                 for val_img_idx in range(args.num_validation_videos):
                     val_batch = next(test_loader)
 
                     pixel_values = val_batch["video"].to(memory_format=torch.contiguous_format).float()
-                    flow, seg_id = get_seg_flow(yolo_model, unimatch, pixel_values)
+                    pixel_values = pixel_values.to(accelerator.device)
                     model_input = encode_video(pixel_values).to(dtype=weight_dtype)
 
+                    flow, seg_id = get_seg_flow(yolo_model, unimatch, pixel_values)
                     controlnet_encoded_frames = torch.cat([flow, seg_id],
                         dim=2).to(memory_format=torch.contiguous_format).float()
-                    breakpoint()
+                    
                     pil_val_image = Image.fromarray(((pixel_values[0, 0].permute(1, 2, 0).cpu().numpy()+1)*127.5).astype(np.uint8))
                     
                     pipeline_args = {

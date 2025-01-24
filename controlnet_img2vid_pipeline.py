@@ -790,6 +790,8 @@ class CogVideoXImageToVideoControlnetPipeline(DiffusionPipeline, CogVideoXLoraLo
                 width, 
                 do_classifier_free_guidance,
             )
+        else:
+            controlnet_latents = torch.cat([controlnet_latents] * 2) if do_classifier_free_guidance else controlnet_latents
 
         # 7. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
