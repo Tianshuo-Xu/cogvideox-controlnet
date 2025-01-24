@@ -5,8 +5,8 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export CUDA_VISIBLE_DEVICES=0
 export HF_ENDPOINT=https://hf-mirror.com
 
-# if you are not using wth 8 gus, change `accelerate_config_machine_single.yaml --multi_gpu` num_processes as your gpu number
-accelerate launch --config_file 0.yaml \
+# if you are not using wth 8 gpus, change `accelerate_config_machine_single.yaml --multi_gpu` num_processes as your gpu number
+accelerate launch --config_file 8.yaml \
   train_controlnet.py \
   --tracker_name "cogvideox-controlnet" \
   --gradient_checkpointing \
@@ -17,7 +17,7 @@ accelerate launch --config_file 0.yaml \
   --validation_video "../resources/car.mp4:::../resources/ship.mp4" \
   --validation_prompt_separator ::: \
   --num_inference_steps 28 \
-  --num_validation_videos 8 \
+  --num_validation_videos 4 \
   --validation_steps 500 \
   --seed 42 \
   --mixed_precision bf16 \
@@ -39,7 +39,7 @@ accelerate launch --config_file 0.yaml \
   --init_from_transformer \
   --train_batch_size 1 \
   --dataloader_num_workers 0 \
-  --num_train_epochs 1 \
+  --num_train_epochs 10 \
   --checkpointing_steps 1000 \
   --gradient_accumulation_steps 1 \
   --learning_rate 1e-5 \

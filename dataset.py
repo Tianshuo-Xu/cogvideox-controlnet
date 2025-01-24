@@ -123,15 +123,17 @@ class YoutubeVideoData(Dataset):
             crop_y = random.randrange(pixel_values.shape[2] - self.sample_size[0] + 1)
             crop_x = random.randrange(pixel_values.shape[3] - self.sample_size[1] + 1)
             pixel_values = pixel_values[:, :, crop_y : crop_y + self.sample_size[0], crop_x : crop_x + self.sample_size[1]]
-            video_name += '_crop'
 
         if self.random_flip and random.random() <= 0.5:
             pixel_values = torch.flip(pixel_values, dims=[3])
-            video_name += '_flip'
 
         pixel_values = pixel_values / 127.5 - 1
         
-        sample = dict(video=pixel_values, caption="a realistic driving scenario with high visual quality, high resolution")
+        sample = dict(
+            video=pixel_values, 
+            video_name=video_name,
+            caption="a realistic driving scenario with high visual quality, high resolution"
+            )
         return sample
 
 

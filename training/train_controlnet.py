@@ -59,7 +59,10 @@ from cogvideo_controlnet import CogVideoXControlnet
 
 from train_utils.unimatch.unimatch.unimatch import UniMatch
 from train_utils.unimatch.utils.flow_viz import flow_to_image
+from train_utils.degradation import degrade_image
+
 from PIL import Image
+import albumentations as A
 
 
 FLOW_SCALE = 128
@@ -137,6 +140,27 @@ def get_optical_flow(unimatch, video_frame):
     
     return torch.cat(flows, dim=1).to(torch.float16)
 
+
+shape_transform = A.Compose([
+    A.ElasticTransform(
+        alpha=15, sigma=10, 
+        alpha_affine=5, p = 1.0
+        )
+])
+
+def perturbation(video_input):
+    device, dtype = video_input.device, video_input.dtype
+    t = video_input.shape[0]
+    video_input = video_input.cpu().numpy().astype(np.uint8)
+    transformed_video = np.zeros_like(video_input)
+
+    for j in range(t):
+        frame = video_input[j].transpose(1, 2, 0)
+        transformed_frame = shape_transform(image=frame)["image"]
+        transformed_video[j] = transformed_frame.transpose(2, 0, 1)
+
+    return torch.from_numpy(transformed_video).to(device=device, dtype=dtype)
+
 import cv2
 import torch.nn.functional as F
 palette = np.random.randint(0, 255, size=(1000, 3), dtype=np.uint8)  # For tracking IDs
@@ -188,7 +212,7 @@ def get_seg_map(yolo_model, video_frame):
     return torch.cat(mask_images, dim=0).unsqueeze(0), mask0
 
 @torch.no_grad()
-def get_seg_flow(yolo_model, unimatch, video_frames, random_mask=True, perterb=True):
+def get_seg_flow(yolo_model, unimatch, video_frames, perterb=True):
     '''
         Input:
             video_frames: [b, t, c, h, w]
@@ -198,12 +222,20 @@ def get_seg_flow(yolo_model, unimatch, video_frames, random_mask=True, perterb=T
     '''
     video_frames = video_frames * 255
     flow = get_optical_flow(unimatch, video_frames)  # flow, direct_flow: [b, f-1, 2, h, w]
+    if True:
+        de_flow = []
+        for f in flow:
+            de_flow.append(degrade_image(f, scale_factor=16, noise_type='gaussian', noise_std=10).unsqueeze(0))
+        flow = torch.cat(de_flow, dim=0)
     flow = torch.cat([flow, torch.zeros_like(flow[:, 0:1])], dim=1) / FLOW_SCALE
 
     mask_image_batch = []
 
     for b, video_frame in enumerate(video_frames):   # i: batch, j: frame
         s_maps, _ = get_seg_map(yolo_model, video_frame)
+
+        if True:
+            s_maps = perturbation(s_maps[0]).unsqueeze(0)
         mask_image_batch.append(s_maps.to(video_frames.device))       
 
     mask_image_batch = torch.cat(mask_image_batch, dim=0).to(torch.float16) / 127.5 - 1  # torch.Size([1, 24, 3, 256, 512]), [0, 1], fp16
@@ -610,8 +642,8 @@ def log_validation(
     temp_nps_1 = np.concatenate([video, gt_video], axis=2)
     total_nps = np.concatenate([temp_nps_0, temp_nps_1], axis=1)
 
-    idx = gts["idx"]
-    filename = os.path.join(args.output_dir, "validation", f"epoch{epoch}", f"video_{idx}.mp4")
+    video_name = gts["video_name"]
+    filename = os.path.join(args.output_dir, "validation", f"epoch{epoch}", f"{video_name}.mp4")
     export_to_video(total_nps, filename, fps=8)
 
 
@@ -843,7 +875,7 @@ def main(args):
     logging_dir = Path(args.output_dir, args.logging_dir)
 
     accelerator_project_config = ProjectConfiguration(project_dir=args.output_dir, logging_dir=logging_dir)
-    kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+    kwargs = DistributedDataParallelKwargs(find_unused_parameters=False)
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision=args.mixed_precision,
@@ -1359,7 +1391,12 @@ def main(args):
                         accelerator=accelerator,
                         pipeline_args=pipeline_args,
                         epoch=epoch,
-                        gts=dict(video=pixel_values, flow=flow, seg_id=seg_id, idx=val_img_idx)
+                        gts=dict(
+                            video=pixel_values, 
+                            flow=flow, 
+                            seg_id=seg_id, 
+                            video_name=val_batch["video_name"]
+                            )
                     )
 
                 del pipe
