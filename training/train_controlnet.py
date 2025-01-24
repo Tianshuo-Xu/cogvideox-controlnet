@@ -44,16 +44,27 @@ from diffusers.optimization import get_scheduler
 from diffusers.pipelines.cogvideo.pipeline_cogvideox import get_resize_crop_region_for_grid
 from diffusers.training_utils import (
     cast_training_params,
-    clear_objs_and_retain_memory,
+    # clear_objs_and_retain_memory,
 )
 from diffusers.utils import check_min_version, export_to_video, is_wandb_available
 from diffusers.utils.hub_utils import load_or_create_model_card, populate_model_card
 from diffusers.utils.torch_utils import is_compiled_module
 
-from controlnet_datasets import OpenvidControlnetDataset
-from controlnet_pipeline import ControlnetCogVideoXPipeline
+# from controlnet_datasets import OpenvidControlnetDataset
+from dataset import YoutubeVideoData
+# from controlnet_pipeline import ControlnetCogVideoXPipeline
+from controlnet_img2vid_pipeline import CogVideoXImageToVideoControlnetPipeline
 from cogvideo_transformer import CustomCogVideoXTransformer3DModel
 from cogvideo_controlnet import CogVideoXControlnet
+
+from train_utils.unimatch.unimatch.unimatch import UniMatch
+from train_utils.unimatch.utils.flow_viz import flow_to_image
+from PIL import Image
+
+
+FLOW_SCALE = 128
+PROMPT = "a realistic driving scenario with high visual quality, high resolution"
+
 
 if is_wandb_available():
     import wandb
@@ -62,6 +73,143 @@ if is_wandb_available():
 check_min_version("0.31.0.dev0")
 
 logger = get_logger(__name__)
+
+
+def preprocess_size(image1, image2, padding_factor=32):
+    transpose_img = False
+    # the model is trained with size: width > height
+    if image1.size(-2) > image1.size(-1):
+        image1 = torch.transpose(image1, -2, -1)
+        image2 = torch.transpose(image2, -2, -1)
+        transpose_img = True
+
+    # inference_size = [int(np.ceil(image1.size(-2) / padding_factor)) * padding_factor,
+    #                 int(np.ceil(image1.size(-1) / padding_factor)) * padding_factor]
+        
+    inference_size = [384, 512]
+
+    assert isinstance(inference_size, list) or isinstance(inference_size, tuple)
+    ori_size = image1.shape[-2:]
+
+    # resize before inference
+    if inference_size[0] != ori_size[0] or inference_size[1] != ori_size[1]:
+        image1 = F.interpolate(image1, size=inference_size, mode='bilinear',
+                                align_corners=True)
+        image2 = F.interpolate(image2, size=inference_size, mode='bilinear',
+                                align_corners=True)
+    
+    return image1, image2, inference_size, ori_size, transpose_img
+
+
+def postprocess_size(flow_pr, inference_size, ori_size, transpose_img):
+    if inference_size[0] != ori_size[0] or inference_size[1] != ori_size[1]:
+        flow_pr = F.interpolate(flow_pr, size=ori_size, mode='bilinear',
+                                align_corners=True)
+        flow_pr[:, 0] = flow_pr[:, 0] * ori_size[-1] / inference_size[-1]
+        flow_pr[:, 1] = flow_pr[:, 1] * ori_size[-2] / inference_size[-2]
+
+    if transpose_img:
+        flow_pr = torch.transpose(flow_pr, -2, -1)
+    
+    return flow_pr
+
+
+@torch.no_grad()
+def get_optical_flow(unimatch, video_frame):
+    '''
+        video_frame: [b, t, c, w, h]
+    '''
+    flows = []
+    for i in range(video_frame.shape[1] - 1):
+        image1, image2 = video_frame[:, i], video_frame[:, i+1]
+
+        image1_r, image2_r, inference_size, ori_size, transpose_img = preprocess_size(image1, image2)
+        results_r = unimatch(image1_r, image2_r,
+            attn_type='swin',
+            attn_splits_list=[2, 8],
+            corr_radius_list=[-1, 4],
+            prop_radius_list=[-1, 1],
+            num_reg_refine=6,
+            task='flow',
+            pred_bidir_flow=False,
+            )['flow_preds'][-1]
+        flows.append(postprocess_size(results_r, inference_size, ori_size, transpose_img).unsqueeze(1)) 
+    
+    return torch.cat(flows, dim=1).to(torch.float16)
+
+import cv2
+import torch.nn.functional as F
+palette = np.random.randint(0, 255, size=(1000, 3), dtype=np.uint8)  # For tracking IDs
+
+@torch.no_grad()
+def get_seg_map(yolo_model, video_frame):
+    frame_height, frame_width = video_frame.shape[2:]
+    mask_images = []
+    mask0 = None
+    if yolo_model.predictor is not None:
+        for tracker in yolo_model.predictor.trackers:
+            tracker.reset()
+            tracker.reset_id()
+
+    # for frame_id, result in enumerate(tracking_results[:-1]):
+    for frame_id, frame in enumerate(video_frame):
+        result = yolo_model.track(
+            source=frame.permute(1, 2, 0).cpu().numpy().astype(np.uint8), 
+            persist=True, verbose=False, conf=0.2, iou=0.2, 
+            tracker="bytetrack.yaml")[0]
+        
+        # Create empty images for masks
+        mask_image = np.zeros((frame_height, frame_width, 3), dtype=np.uint8)
+
+        # Extract masks and detection information
+        masks = result.masks
+        boxes = result.boxes
+        ids = boxes.id.cpu().numpy() if boxes.id is not None else []
+
+        if masks is not None:
+            if frame_id == 0:
+                mask0 = masks.data
+
+            for i, mask in enumerate(masks.data):
+                # Convert mask to a binary mask
+                binary_mask = mask.cpu().numpy().astype(np.uint8)
+                binary_mask = cv2.resize(binary_mask, (frame_width, frame_height), interpolation=cv2.INTER_NEAREST)
+
+                track_id = int(ids[i]) if len(ids) > i else 0
+                color = palette[track_id % len(palette)].tolist()
+                colored_mask = np.zeros_like(mask_image)
+                for c in range(3):
+                    colored_mask[:, :, c] = binary_mask * color[c]
+
+                mask_image = cv2.addWeighted(mask_image, 1, colored_mask, 0.5, 0)
+
+        mask_images.append(torch.from_numpy(mask_image).permute(2, 0, 1).unsqueeze(0))
+
+    return torch.cat(mask_images, dim=0).unsqueeze(0), mask0
+
+@torch.no_grad()
+def get_seg_flow(yolo_model, unimatch, video_frames, random_mask=True, perterb=True):
+    '''
+        Input:
+            video_frames: [b, t, c, h, w]
+        Output (fp16, cuda):
+            optical_flow: [b, t-1, 2, h, w], 
+            seg_map: [b, t-1, 3, h, w].
+    '''
+    video_frames = video_frames * 255
+    flow = get_optical_flow(unimatch, video_frames)  # flow, direct_flow: [b, f-1, 2, h, w]
+    # breakpoint()
+    flow = torch.cat([flow, torch.zeros_like(flow[:, 0:1])], dim=1) / FLOW_SCALE
+
+    mask_image_batch = []
+
+    for b, video_frame in enumerate(video_frames):   # i: batch, j: frame
+        s_maps, _ = get_seg_map(yolo_model, video_frame)
+        mask_image_batch.append(s_maps.to(video_frames.device))       
+
+    mask_image_batch = torch.cat(mask_image_batch, dim=0).to(torch.float16) / 127.5 - 1  # torch.Size([1, 24, 3, 256, 512]), [0, 1], fp16
+    
+    return flow, mask_image_batch
 
 
 def get_args():
@@ -440,12 +588,9 @@ def log_validation(
     accelerator,
     pipeline_args,
     epoch,
+    gts=None,
     is_final_validation: bool = False,
 ):
-    logger.info(
-        f"Running validation... \n Generating {args.num_validation_videos} videos with prompt: {pipeline_args['prompt']}."
-    )
-    # We train on the simplified learning objective. If we were previously predicting a variance, we need the scheduler to ignore it
     scheduler_args = {}
 
     if "variance_type" in pipe.scheduler.config:
@@ -467,20 +612,13 @@ def log_validation(
     for _ in range(args.num_validation_videos):
         video = pipe(**pipeline_args, generator=generator, output_type="np").frames[0]
         videos.append(video)
+    breakpoint()
 
     for i, video in enumerate(videos):
-        prompt = (
-            pipeline_args["prompt"][:25]
-            .replace(" ", "_")
-            .replace(" ", "_")
-            .replace("'", "_")
-            .replace('"', "_")
-            .replace("/", "_")
-        )
-        filename = os.path.join(args.output_dir, f"{epoch}_video_{i}_{prompt}.mp4")
+        filename = os.path.join(args.output_dir, f"{epoch}_video_{i}.mp4")
         export_to_video(video, filename, fps=8)
 
-    clear_objs_and_retain_memory([pipe])
+    # clear_objs_and_retain_memory([pipe])
 
     return videos
 
@@ -684,6 +822,19 @@ def get_optimizer(args, params_to_optimize, use_deepspeed: bool = False):
     return optimizer
 
 
+def create_iterator(sample_size, sample_dataset):
+        while True:
+            sample_loader = torch.utils.data.DataLoader(
+                dataset=sample_dataset,
+                batch_size=sample_size,
+                shuffle=True,
+                drop_last=True
+            )
+
+            for item in sample_loader:
+                yield item
+
+
 def main(args):
     if args.report_to == "wandb" and args.hub_token is not None:
         raise ValueError(
@@ -840,6 +991,24 @@ def main(args):
     vae.to(accelerator.device, dtype=weight_dtype)
     controlnet.to(accelerator.device, dtype=weight_dtype)
 
+    # Define Unimatch for optical flow prediction
+    unimatch = UniMatch(feature_channels=128,
+        num_scales=2,
+        upsample_factor=4,
+        num_head=1,
+        ffn_dim_expansion=4,
+        num_transformer_layers=6,
+        reg_refine=True,
+        task='flow').to(accelerator.device)
+    checkpoint = torch.load('./train_utils/unimatch/pretrained/gmflow-scale2-regrefine6-mixdata-train320x576-4e7b215d.pth')
+    unimatch.load_state_dict(checkpoint['model'])
+    unimatch.eval()
+    unimatch.requires_grad_(False)
+
+    from ultralytics import YOLO
+    yolo_model = YOLO('/hpc2hdd/home/txu647/code/segment-anything-2/yolo11l-seg.pt')  # Replace with your model variant if needed
+    yolo_model.to(accelerator.device)
+
     if args.gradient_checkpointing:
         transformer.enable_gradient_checkpointing()
         controlnet.enable_gradient_checkpointing()
@@ -882,15 +1051,20 @@ def main(args):
     optimizer = get_optimizer(args, params_to_optimize, use_deepspeed=use_deepspeed_optimizer)
 
     # Dataset and DataLoader
-    train_dataset = OpenvidControlnetDataset(
-        video_root_dir=args.video_root_dir,
-        csv_path=args.csv_path,
-        image_size=(args.height, args.width), 
-        stride=(args.stride_min, args.stride_max),
+    train_dataset = YoutubeVideoData(
+        sample_size=[args.height, args.width], 
+        sample_stride=[args.stride_min, args.stride_max], 
         sample_n_frames=args.max_num_frames,
-        hflip_p=args.hflip_p,
-        controlnet_type=args.controlnet_type,
+        random_flip=True,
+        random_crop=True
     )
+
+    test_dataset = YoutubeVideoData(
+        sample_size=[args.height, args.width], 
+        sample_stride=[args.stride_min, args.stride_max], 
+        sample_n_frames=args.max_num_frames,
+    )
+    test_loader = create_iterator(1, test_dataset)
         
     def encode_video(video):
         video = video.to(accelerator.device, dtype=vae.dtype)
@@ -901,18 +1075,18 @@ def main(args):
     def collate_fn(examples):
         videos = [example["video"] for example in examples]
         prompts = [example["caption"] for example in examples]
-        controlnet_videos = [example["controlnet_video"] for example in examples]
+        # controlnet_videos = [example["controlnet_video"] for example in examples]
 
         videos = torch.stack(videos)
         videos = videos.to(memory_format=torch.contiguous_format).float()
-
-        controlnet_videos = torch.stack(controlnet_videos)
-        controlnet_videos = controlnet_videos.to(memory_format=torch.contiguous_format).float()
+        
+        # controlnet_videos = torch.stack(controlnet_videos)
+        # controlnet_videos = controlnet_videos.to(memory_format=torch.contiguous_format).float()
 
         return {
             "videos": videos,
             "prompts": prompts,
-            "controlnet_videos": controlnet_videos,
+            # "controlnet_videos": controlnet_videos,
         }
 
     train_dataloader = DataLoader(
@@ -1003,11 +1177,15 @@ def main(args):
             models_to_accumulate = [controlnet]
 
             with accelerator.accumulate(models_to_accumulate):
-                model_input = encode_video(batch["videos"]).to(dtype=weight_dtype)  # [B, F, C, H, W]
-                controlnet_encoded_frames = batch["controlnet_videos"]
+                pixel_values = batch["videos"]
+                flow, seg_id = get_seg_flow(yolo_model, unimatch, pixel_values)
+                model_input = encode_video(pixel_values).to(dtype=weight_dtype)  # [B, F, C, H, W]
+                images = pixel_values[:, 0]
+                controlnet_encoded_frames = torch.cat([flow, seg_id],
+                            dim=2).to(memory_format=torch.contiguous_format).float()
+                # controlnet_encoded_frames = seg_id.to(memory_format=torch.contiguous_format).float()
+
                 prompts = batch["prompts"]
-                
-                # encode prompts
                 prompt_embeds = compute_prompt_embeddings(
                     tokenizer,
                     text_encoder,
@@ -1027,7 +1205,24 @@ def main(args):
                     0, scheduler.config.num_train_timesteps, (batch_size,), device=model_input.device
                 )
                 timesteps = timesteps.long()
-        
+
+                # Add frame dimension to images [B,C,H,W] -> [B,C,F,H,W]
+                images = images.unsqueeze(2)
+                # Add noise to images
+                image_noise_sigma = torch.normal(mean=-3.0, std=0.5, size=(1,), device=accelerator.device)
+                image_noise_sigma = torch.exp(image_noise_sigma).to(dtype=images.dtype)
+                noisy_images = images + torch.randn_like(images) * image_noise_sigma[:, None, None, None, None]
+                image_latent_dist = vae.encode(noisy_images.to(dtype=vae.dtype)).latent_dist
+                image_latents = image_latent_dist.sample() * vae.config.scaling_factor
+
+                image_latents = image_latents.permute(0, 2, 1, 3, 4)
+                assert (model_input.shape[0], *model_input.shape[2:]) == (image_latents.shape[0], *image_latents.shape[2:])
+
+                # Padding image_latents to the same frame number as latent
+                padding_shape = (model_input.shape[0], model_input.shape[1] - 1, *model_input.shape[2:])
+                latent_padding = image_latents.new_zeros(padding_shape)
+                image_latents = torch.cat([image_latents, latent_padding], dim=1)
+
                 # Prepare rotary embeds
                 image_rotary_emb = (
                     prepare_rotary_positional_embeddings(
@@ -1046,9 +1241,10 @@ def main(args):
                 # Add noise to the model input according to the noise magnitude at each timestep
                 # (this is the forward diffusion process)
                 noisy_model_input = scheduler.add_noise(model_input, noise, timesteps)
+                latent_img_noisy = torch.cat([noisy_model_input, image_latents], dim=2)
 
                 controlnet_states = controlnet(
-                    hidden_states=noisy_model_input,
+                    hidden_states=latent_img_noisy,
                     encoder_hidden_states=prompt_embeds,
                     image_rotary_emb=image_rotary_emb,
                     controlnet_states=controlnet_encoded_frames,
@@ -1061,7 +1257,7 @@ def main(args):
                     controlnet_states = controlnet_states.to(dtype=weight_dtype)
                 # Predict the noise residual
                 model_output = transformer(
-                    hidden_states=noisy_model_input,
+                    hidden_states=latent_img_noisy,
                     encoder_hidden_states=prompt_embeds,
                     timestep=timesteps,
                     image_rotary_emb=image_rotary_emb,
@@ -1110,43 +1306,56 @@ def main(args):
             if global_step >= args.max_train_steps:
                 break
 
-            if accelerator.is_main_process:
-                if args.validation_prompt is not None and (step + 1) % args.validation_steps == 0:
-                    # Create pipeline
-                    pipe = ControlnetCogVideoXPipeline.from_pretrained(
-                        args.pretrained_model_name_or_path,
-                        transformer=unwrap_model(transformer),
-                        text_encoder=unwrap_model(text_encoder),
-                        vae=unwrap_model(vae),
-                        controlnet=unwrap_model(controlnet),
-                        scheduler=scheduler,
-                        torch_dtype=weight_dtype,
+            if accelerator.is_main_process and step % args.validation_steps == 0:
+                logger.info(
+                    f"Running validation... \n Generating {args.num_validation_videos} videos."
+                )
+                pipe = CogVideoXImageToVideoControlnetPipeline.from_pretrained(
+                    args.pretrained_model_name_or_path,
+                    transformer=unwrap_model(transformer),
+                    text_encoder=unwrap_model(text_encoder),
+                    vae=unwrap_model(vae),
+                    controlnet=unwrap_model(controlnet),
+                    scheduler=scheduler,
+                    torch_dtype=weight_dtype,
+                )
+
+                for val_img_idx in range(args.num_validation_videos):
+                    val_batch = next(test_loader)
+
+                    pixel_values = val_batch["video"].to(memory_format=torch.contiguous_format).float()
+                    flow, seg_id = get_seg_flow(yolo_model, unimatch, pixel_values)
+                    model_input = encode_video(pixel_values).to(dtype=weight_dtype)
+
+                    controlnet_encoded_frames = torch.cat([flow, seg_id],
+                        dim=2).to(memory_format=torch.contiguous_format).float()
+                    breakpoint()
+                    pil_val_image = Image.fromarray(((pixel_values[0, 0].permute(1, 2, 0).cpu().numpy()+1)*127.5).astype(np.uint8))
+                    
+                    pipeline_args = {
+                        "image": pil_val_image,
+                        "prompt": PROMPT,
+                        "controlnet_latents": controlnet_encoded_frames,
+                        "guidance_scale": args.guidance_scale,
+                        "use_dynamic_cfg": args.use_dynamic_cfg,
+                        "height": args.height,
+                        "width": args.width,
+                        "num_frames": args.max_num_frames,
+                        "num_inference_steps": args.num_inference_steps,
+                        "controlnet_weights": args.controlnet_weights,
+                    }
+
+                    log_validation(
+                        pipe=pipe,
+                        args=args,
+                        accelerator=accelerator,
+                        pipeline_args=pipeline_args,
+                        epoch=epoch,
+                        gts=dict(video=pixel_values, flow=flow, seg_id=seg_id, idx=val_img_idx)
                     )
-    
-                    validation_prompts = args.validation_prompt.split(args.validation_prompt_separator)
-                    validation_videos = args.validation_video.split(args.validation_prompt_separator)
-                    for validation_prompt, validation_video in zip(validation_prompts, validation_videos):
-                        numpy_frames = read_video(validation_video, frames_count=args.max_num_frames)
-                        controlnet_frames = np.stack([train_dataset.controlnet_processor(x) for x in numpy_frames])
-                        pipeline_args = {
-                            "prompt": validation_prompt,
-                            "controlnet_frames": controlnet_frames,
-                            "guidance_scale": args.guidance_scale,
-                            "use_dynamic_cfg": args.use_dynamic_cfg,
-                            "height": args.height,
-                            "width": args.width,
-                            "num_frames": args.max_num_frames,
-                            "num_inference_steps": args.num_inference_steps,
-                            "controlnet_weights": args.controlnet_weights,
-                        }
-    
-                        validation_outputs = log_validation(
-                            pipe=pipe,
-                            args=args,
-                            accelerator=accelerator,
-                            pipeline_args=pipeline_args,
-                            epoch=epoch,
-                        )
+
+                del pipe
+                torch.cuda.empty_cache()
     
     accelerator.wait_for_everyone()
     accelerator.end_training()

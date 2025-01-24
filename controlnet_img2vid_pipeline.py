@@ -828,7 +828,7 @@ class CogVideoXImageToVideoControlnetPipeline(DiffusionPipeline, CogVideoXLoraLo
                 if (controlnet_guidance_start <= current_sampling_percent < controlnet_guidance_end):
                     # extract controlnet hidden state
                     controlnet_states = self.controlnet(
-                        hidden_states=latent_model_input[:, :, :16, :, :],
+                        hidden_states=latent_model_input,
                         encoder_hidden_states=prompt_embeds,
                         image_rotary_emb=image_rotary_emb,
                         controlnet_states=controlnet_latents,

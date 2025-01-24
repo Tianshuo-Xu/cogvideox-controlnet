@@ -76,9 +76,12 @@ class CogVideoXControlnet(ModelMixin, ConfigMixin, PeftAdapterMixin):
         )
         
         # 1. Patch embedding
+        controlnet_inchannels = vae_channels*2 + input_channels[2]
+        print("controlnet in_channels:", controlnet_inchannels)
+        
         self.patch_embed = CogVideoXPatchEmbed(
             patch_size=patch_size,
-            in_channels=vae_channels + input_channels[2],
+            in_channels=controlnet_inchannels,
             embed_dim=inner_dim,
             bias=True,
             sample_width=sample_width,
@@ -163,7 +166,7 @@ class CogVideoXControlnet(ModelMixin, ConfigMixin, PeftAdapterMixin):
         controlnet_states = self.controlnet_encode_second(controlnet_states)
         controlnet_states = self.compress_time(controlnet_states, num_frames=num_frames) 
         controlnet_states = rearrange(controlnet_states, '(b f) c h w -> b f c h w', b=batch_size)
-
+        # breakpoint()
         hidden_states = torch.cat([hidden_states, controlnet_states], dim=2)
         # controlnet_states = self.controlnext_encoder(controlnet_states, timestep=timestep)
         # 1. Time embedding
@@ -175,15 +178,12 @@ class CogVideoXControlnet(ModelMixin, ConfigMixin, PeftAdapterMixin):
         # there might be better ways to encapsulate this.
         t_emb = t_emb.to(dtype=hidden_states.dtype)
         emb = self.time_embedding(t_emb, timestep_cond)
-        
         hidden_states = self.patch_embed(encoder_hidden_states, hidden_states)
         hidden_states = self.embedding_dropout(hidden_states)
-
 
         text_seq_length = encoder_hidden_states.shape[1]
         encoder_hidden_states = hidden_states[:, :text_seq_length]
         hidden_states = hidden_states[:, text_seq_length:]
-
         
         controlnet_hidden_states = ()
         # 3. Transformer blocks
